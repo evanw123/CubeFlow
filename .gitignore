@@ -1,0 +1,32 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+webapp/node_modules/
+
+# Build/cache
+.next/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+venv311/
+.app_state/
+followtest fail.py
+testp2-FAIL

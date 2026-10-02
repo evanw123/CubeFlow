@@ -1,0 +1,10 @@
+{
+  "name": "cubeflow-webapp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve": "python3 ../app_server.py",
+    "dev": "python3 ../app_server.py",
+    "test": "node --test tests/*.test.js"
+  }
+}
