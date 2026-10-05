@@ -3,9 +3,11 @@
 CubeFlow is an end-to-end computer-vision application for scanning, validating,
 solving, and visualizing a physical 3×3 Rubik's Cube.
 
-## Live Demo
+## Links
 
-**[Try CubeFlow →](https://cubeflow.onrender.com/)**
+- **Live Demo:** https://cubeflow.onrender.com/
+- **Research Paper:** https://zenodo.org/records/23150511
+- **Source Code:** https://github.com/evanw123/CubeFlow
 
 No installation is required. Allow camera access, calibrate the six cube colors,
 and scan a physical Rubik's Cube directly in your browser.
