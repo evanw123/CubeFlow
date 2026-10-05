@@ -6,8 +6,7 @@ solving, and visualizing a physical 3×3 Rubik's Cube.
 ## Links
 
 - **Live Demo:** https://cubeflow.onrender.com/
-- **Research Paper:** https://zenodo.org/records/23150511
-- **Source Code:** https://github.com/evanw123/CubeFlow
+- **Published Research Paper:** https://zenodo.org/records/23150511
 
 No installation is required. Allow camera access, calibrate the six cube colors,
 and scan a physical Rubik's Cube directly in your browser.
