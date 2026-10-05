@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from collections import deque, Counter
 import os
 import subprocess
 import sys
@@ -36,6 +35,15 @@ from cube_backend.cfop_solver import (
     solve_cfop_from_cube_state,
     solve_white_cross,
 )
+from cube_backend.color_recognition import (
+    DISPLAY_MAP,
+    all_face_stable,
+    classify_from_calibration,
+    extract_stable_face_grid,
+    median_bgr_from_patch,
+    reset_sticker_history,
+    get_stable_label,
+)
 from cube_backend.cube_state import CubeState
 from cube_backend.f2l_cases import classify_all_f2l_cases
 from cube_backend.move_utils import parse_alg
@@ -49,16 +57,6 @@ print("Starting Rubik scanner with backend cube state...")
 # =========================================================
 # Utility functions
 # =========================================================
-
-DISPLAY_MAP = {
-    "WHITE":  (255, 255, 255),
-    "YELLOW": (0, 255, 255),
-    "RED":    (0, 0, 255),
-    "ORANGE": (0, 165, 255),
-    "BLUE":   (255, 0, 0),
-    "GREEN":  (0, 255, 0),
-    "UNKNOWN": (128, 128, 128),
-}
 
 SLOT_TO_CENTER_COLOR = {
     "F": "GREEN",
@@ -85,57 +83,6 @@ WEB_PREVIEW_WIDTH = 520
 WEB_PREVIEW_JPEG_QUALITY = 58
 WEB_STATE_MAX_FPS = 2
 WEB_PERF_LOG_INTERVAL = 5.0
-
-
-def median_bgr_from_patch(patch):
-    if patch.size == 0:
-        return np.array([0, 0, 0], dtype=np.uint8)
-    pixels = patch.reshape(-1, 3)
-    med = np.median(pixels, axis=0)
-    return med.astype(np.uint8)
-
-
-def bgr_to_lab(bgr):
-    arr = np.uint8([[bgr]])
-    lab = cv2.cvtColor(arr, cv2.COLOR_BGR2LAB)[0][0]
-    return lab.astype(np.float32)
-
-
-def bgr_to_hsv(bgr):
-    arr = np.uint8([[bgr]])
-    hsv = cv2.cvtColor(arr, cv2.COLOR_BGR2HSV)[0][0]
-    return hsv.astype(np.int32)
-
-
-def color_distance_lab(bgr1, bgr2):
-    lab1 = bgr_to_lab(bgr1)
-    lab2 = bgr_to_lab(bgr2)
-    return float(np.linalg.norm(lab1 - lab2))
-
-
-def classify_from_calibration(bgr, calibration):
-    hsv = bgr_to_hsv(bgr)
-    h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
-
-    if s < 45 and v > 120:
-        return "WHITE", DISPLAY_MAP["WHITE"], f"S:{s} V:{v}"
-
-    if len(calibration) == 0:
-        return "UNKNOWN", DISPLAY_MAP["UNKNOWN"], f"H:{h} S:{s} V:{v}"
-
-    best_name = None
-    best_dist = 1e9
-
-    for color_name, ref_bgr in calibration.items():
-        dist = color_distance_lab(bgr, ref_bgr)
-        if dist < best_dist:
-            best_dist = dist
-            best_name = color_name
-
-    if best_name is None:
-        return "UNKNOWN", DISPLAY_MAP["UNKNOWN"], f"H:{h} S:{s} V:{v}"
-
-    return best_name, DISPLAY_MAP[best_name], f"D:{best_dist:.1f}"
 
 
 def get_sticker_patch(sample_frame, center_x, center_y, sample_size):
@@ -194,36 +141,6 @@ def get_center_patch_multi(sample_frame, center_x, center_y):
     all_pixels = np.vstack([p.reshape(-1, 3) for p in patches])
     med = np.median(all_pixels, axis=0).astype(np.uint8)
     return med, rects
-
-
-# =========================================================
-# Stability helpers
-# =========================================================
-
-def get_stable_label(history_deque, min_count=5):
-    if len(history_deque) == 0:
-        return "UNKNOWN", False
-
-    counts = Counter(history_deque)
-    label, count = counts.most_common(1)[0]
-    return label, count >= min_count
-
-
-def all_face_stable(stable_grid):
-    for row in range(3):
-        for col in range(3):
-            _, is_stable = stable_grid[row][col]
-            if not is_stable:
-                return False
-    return True
-
-
-def extract_stable_face_grid(stable_grid):
-    return [[stable_grid[r][c][0] for c in range(3)] for r in range(3)]
-
-
-def reset_sticker_history(maxlen=7):
-    return [[deque(maxlen=maxlen) for _ in range(3)] for _ in range(3)]
 
 
 def resize_for_web_preview(frame, max_width):

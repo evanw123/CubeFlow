@@ -43,7 +43,7 @@ export function renderAppShell({ route, state, pageTitle, pageDescription, pageH
             <p>${escapeHtml(pageDescription)}</p>
           </div>
           <div class="topbar__actions">
-            <button class="button button--ghost" data-action="launch-scanner">${state?.scanner?.running ? "Scanner Running" : "Launch Scanner"}</button>
+            <button class="button button--ghost" data-route="scan">${state?.scanner?.running ? "Camera Active" : "Scan Cube"}</button>
             <button class="button button--secondary" data-route="settings">Settings</button>
           </div>
         </header>

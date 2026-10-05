@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .cube_state import CubeState, FACE_ORDER
+from .web_sessions import get_active_web_session
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP_STATE_DIR = REPO_ROOT / ".app_state"
@@ -172,6 +174,12 @@ def _save_json(path: Path, value: Any) -> None:
 
 
 def load_settings() -> dict[str, Any]:
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            merged = DEFAULT_SETTINGS.copy()
+            merged.update(deepcopy(web_session.settings))
+            return merged
     stored = _load_json(SETTINGS_PATH, {})
     merged = DEFAULT_SETTINGS.copy()
     if isinstance(stored, dict):
@@ -182,12 +190,25 @@ def load_settings() -> dict[str, Any]:
 def save_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     merged = DEFAULT_SETTINGS.copy()
     merged.update(dict(settings))
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            web_session.settings = deepcopy(merged)
+            web_session.touch()
+        return merged
     _save_json(SETTINGS_PATH, merged)
     return merged
 
 
 def load_app_state() -> dict[str, Any]:
     state = default_app_state()
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            if isinstance(web_session.state, dict):
+                _deep_update(state, deepcopy(web_session.state))
+            web_session.touch()
+        return state
     stored = _load_json(STATE_PATH, {})
     if isinstance(stored, dict):
         _deep_update(state, stored)
@@ -198,6 +219,12 @@ def save_app_state(state: Mapping[str, Any]) -> dict[str, Any]:
     snapshot = default_app_state()
     _deep_update(snapshot, dict(state))
     snapshot["app"]["lastUpdatedAt"] = now_iso()
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            web_session.state = deepcopy(snapshot)
+            web_session.touch()
+        return deepcopy(snapshot)
     _save_json(STATE_PATH, snapshot)
     return snapshot
 
@@ -214,29 +241,52 @@ def reset_app_state() -> dict[str, Any]:
     state["app"]["mode"] = "advanced" if settings.get("debugMode") else "normal"
     save_app_state(state)
     clear_commands()
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            web_session.runtime.clear()
     return state
 
 
 def clear_commands() -> None:
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            web_session.commands.clear()
+            web_session.touch()
+        return
     _save_json(COMMANDS_PATH, [])
 
 
 def enqueue_command(action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    commands = _load_json(COMMANDS_PATH, [])
-    if not isinstance(commands, list):
-        commands = []
     command = {
         "id": f"cmd-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
         "action": action,
         "payload": dict(payload or {}),
         "createdAt": now_iso(),
     }
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            web_session.commands.append(deepcopy(command))
+            web_session.touch()
+        return command
+    commands = _load_json(COMMANDS_PATH, [])
+    if not isinstance(commands, list):
+        commands = []
     commands.append(command)
     _save_json(COMMANDS_PATH, commands)
     return command
 
 
 def pop_pending_commands() -> list[dict[str, Any]]:
+    web_session = get_active_web_session()
+    if web_session is not None:
+        with web_session.lock:
+            commands = deepcopy(web_session.commands)
+            web_session.commands.clear()
+            web_session.touch()
+        return [command for command in commands if isinstance(command, dict)]
     commands = _load_json(COMMANDS_PATH, [])
     if not isinstance(commands, list):
         commands = []

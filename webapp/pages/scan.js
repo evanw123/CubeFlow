@@ -1,7 +1,7 @@
 import { COLOR_HEX, advancedDrawer, cubeNetCard, progressStepper } from "../components/cards.js";
-import { actionButton, emptyState, statusChip } from "../components/ui.js";
+import { actionButton, statusChip } from "../components/ui.js";
 import { commandLabel, escapeHtml } from "../lib/format.js";
-import { api } from "../lib/api.js";
+import { browserScanner } from "../lib/browser-scanner.js";
 
 function renderAdvanced(scanner) {
   const advanced = scanner?.advanced || {};
@@ -31,44 +31,22 @@ function renderAdvanced(scanner) {
 }
 
 function renderPreviewFrame(scanner) {
-  if (scanner?.running && !scanner?.stateAvailable) {
-    return emptyState(
-      "Launching scanner",
-      "The scanner process was launched. Waiting for fresh scanner state from the native window.",
-      actionButton("Relaunch Scanner", "launch-scanner", "secondary"),
-    );
-  }
-
-  if (!scanner?.processRunning) {
-    return emptyState(
-      "Scanner offline",
-      "Launch the scanner to begin capturing faces. The live preview will appear here once the scanner starts.",
-      actionButton("Launch Scanner", "launch-scanner", "primary"),
-    );
-  }
-
-  if (scanner.processRunning && !scanner.previewAvailable) {
-    const message = scanner.stateAvailable
-      ? "Scanner is running. Preview stream is connecting."
-      : "Scanner launch was requested, but fresh scanner state has not arrived yet.";
-    return emptyState(
-      "Preview connecting",
-      message,
-      actionButton("Relaunch Scanner", "launch-scanner", "secondary"),
-    );
-  }
-
+  const cameraIsActive = browserScanner.running;
   return `
-    <div class="scanner-preview-stack">
-      <img
-        class="scanner-preview"
-        data-preview-img
-        data-preview-base="${escapeHtml(scanner.previewStillUrl || "/api/scanner/preview.jpg")}"
-        src="${escapeHtml(`${scanner.previewStillUrl || "/api/scanner/preview.jpg"}?ts=${Date.now()}`)}"
-        alt="Scanner preview"
-      />
-      <div class="scanner-preview-stack__badge">${statusChip("Preview live", "success")}</div>
-      <div class="scanner-preview-stack__hint">Drag your cube into the guide, then wait for a stable read.</div>
+    <div class="scanner-preview-stack browser-camera" data-browser-camera>
+      <video class="scanner-preview" data-browser-video autoplay muted playsinline aria-label="Live browser camera preview"></video>
+      <canvas data-browser-sampling-canvas hidden></canvas>
+      <div class="browser-camera__guide" aria-hidden="true">
+        ${Array.from({ length: 9 }, () => '<span class="browser-camera__cell"></span>').join("")}
+      </div>
+      <div class="scanner-preview-stack__badge" data-browser-camera-status>
+        ${statusChip(scanner?.running ? "Camera ready" : "Camera off", scanner?.running ? "success" : "neutral")}
+      </div>
+      <div class="browser-camera__actions">
+        <button class="button button--primary" type="button" data-camera-action="start" ${cameraIsActive ? "disabled" : ""}>${cameraIsActive ? "Camera Active" : "Start Camera"}</button>
+        <button class="button button--secondary" type="button" data-camera-action="stop" ${cameraIsActive ? "" : "disabled"}>Stop</button>
+      </div>
+      <div class="scanner-preview-stack__hint">Center one cube face in the 3×3 guide. Keep the requested top color at the top.</div>
     </div>
   `;
 }
@@ -110,7 +88,7 @@ function renderCaptureActions(scanner) {
         </div>
       </div>
       <div class="cta-row cta-row--wrap">
-        ${actionButton("Capture", "command:capture", "primary")}
+        ${actionButton("Capture", "command:capture", "primary", scanner.captureReady ? "" : "disabled")}
         ${actionButton("Next", "command:next-step", "secondary")}
         ${actionButton("Previous", "command:previous-step", "secondary")}
         ${actionButton("Clear Face", "command:clear-face", "ghost")}
@@ -194,8 +172,8 @@ function renderCaptureFeedback(scanner) {
 }
 
 function renderHealthCard(scanner) {
-  const processLabel = scanner?.processRunning ? "Running" : scanner?.running ? "Launching" : "Offline";
-  const previewLabel = scanner?.previewAvailable ? "Live" : scanner?.processRunning ? "Connecting" : scanner?.running ? "Waiting" : "Unavailable";
+  const processLabel = scanner?.source === "browser" ? (scanner?.running ? "Browser camera" : "Stopped") : scanner?.processRunning ? "Native fallback" : scanner?.running ? "Launching" : "Offline";
+  const previewLabel = scanner?.previewAvailable ? "Live in browser" : scanner?.running ? "Connecting" : "Unavailable";
   const stateLabel = scanner?.stateAvailable ? "Fresh" : "Stale";
 
   return `
@@ -263,7 +241,7 @@ function renderCalibrationCard(scanner, calibration) {
                 type="button"
                 class="button button--secondary"
                 data-calibration-capture="${escapeHtml(row.name)}"
-                ${scanner?.processRunning && Array.isArray(scanner?.currentCenterBgr) ? "" : "disabled"}
+                ${scanner?.running && Array.isArray(scanner?.currentCenterBgr) ? "" : "disabled"}
               >
                 Capture current center
               </button>
@@ -341,11 +319,6 @@ export function patchScanPage(state) {
   const page = document.querySelector("[data-scan-page]");
   if (!page) return false;
 
-  const previewFrame = page.querySelector("[data-scan-preview-frame]");
-  if (previewFrame) {
-    updateIfChanged(previewFrame, renderPreviewFrame(scanner));
-  }
-
   const stepper = page.querySelector("[data-scan-stepper]");
   if (stepper) updateIfChanged(stepper, progressStepper(scanner));
 
@@ -378,65 +351,40 @@ export function patchScanPage(state) {
 
 export function hydrateScanPage(app) {
   const page = document.querySelector("[data-scan-page]");
-  const img = page?.querySelector("[data-preview-img]");
-  if (!page || !img) return;
+  const video = page?.querySelector("[data-browser-video]");
+  const canvas = page?.querySelector("[data-browser-sampling-canvas]");
+  if (!page || !video || !canvas) return;
 
-  app.scanPreviewToken = (app.scanPreviewToken || 0) + 1;
-  const token = app.scanPreviewToken;
-  const baseUrl = img.dataset.previewBase || app?.state?.scanner?.previewStillUrl || "/api/scanner/preview.jpg";
-  const intervalMs = Math.max(80, Math.round(1000 / Number(app?.state?.scanner?.previewTargetFps || 10)));
+  browserScanner.attach({
+    video,
+    canvas,
+    onState: (nextState) => {
+      app.state = nextState;
+      app.lastStateSignature = JSON.stringify(nextState);
+      patchScanPage(nextState);
+    },
+    onStatus: ({ state: cameraState, message }) => updateCameraStatus(cameraState, message),
+  });
+}
 
-  let inFlight = false;
-  let previewFrameCount = 0;
-  let metricsWindowStartedAt = performance.now();
-  let lastReportedFps = null;
-  const loop = () => {
-    if (token !== app.scanPreviewToken || app.route !== "scan") return;
-    const liveState = app?.state?.scanner || {};
-    const liveImg = document.querySelector("[data-preview-img]");
-    if (!liveImg || !liveImg.isConnected) return;
-    if (!(liveState.processRunning && liveState.previewAvailable)) {
-      window.setTimeout(loop, 220);
-      return;
-    }
-    if (inFlight) {
-      window.setTimeout(loop, intervalMs);
-      return;
-    }
+function updateCameraStatus(cameraState, message) {
+  const status = document.querySelector("[data-browser-camera-status]");
+  const start = document.querySelector('[data-camera-action="start"]');
+  const stop = document.querySelector('[data-camera-action="stop"]');
+  const tone = cameraState === "error" ? "danger" : ["ready", "scanning"].includes(cameraState) ? "success" : cameraState === "requesting" ? "warning" : "neutral";
+  const cameraIsActive = ["ready", "scanning"].includes(cameraState);
+  if (status) status.innerHTML = statusChip(message || "Camera off", tone);
+  if (start) {
+    start.disabled = cameraState === "requesting" || cameraIsActive;
+    start.textContent = cameraState === "requesting" ? "Starting..." : cameraIsActive ? "Camera Active" : "Start Camera";
+  }
+  if (stop) stop.disabled = !cameraIsActive;
+}
 
-    inFlight = true;
-    const nextSrc = `${baseUrl}?ts=${Date.now()}`;
-    const preload = new Image();
-    preload.onload = () => {
-      inFlight = false;
-      if (token !== app.scanPreviewToken || app.route !== "scan") return;
-      const current = document.querySelector("[data-preview-img]");
-      if (current && current.isConnected) {
-        current.src = nextSrc;
-      }
-      previewFrameCount += 1;
-      const elapsedMs = performance.now() - metricsWindowStartedAt;
-      if (elapsedMs >= 2400) {
-        const fpsApprox = previewFrameCount / Math.max(elapsedMs / 1000, 0.001);
-        if (lastReportedFps === null || Math.abs(fpsApprox - lastReportedFps) >= 0.5) {
-          lastReportedFps = fpsApprox;
-          api.reportPreviewMetrics({
-            fpsApprox,
-            targetFps: Number(app?.state?.scanner?.previewTargetFps || 10),
-            source: "browser",
-          }).catch(() => {});
-        }
-        previewFrameCount = 0;
-        metricsWindowStartedAt = performance.now();
-      }
-      window.setTimeout(loop, intervalMs);
-    };
-    preload.onerror = () => {
-      inFlight = false;
-      window.setTimeout(loop, 240);
-    };
-    preload.src = nextSrc;
-  };
+export async function startBrowserCamera() {
+  await browserScanner.start();
+}
 
-  window.setTimeout(loop, intervalMs);
+export function stopBrowserCamera() {
+  browserScanner.stop();
 }

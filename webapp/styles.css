@@ -152,11 +152,11 @@ a { color: inherit; }
 .two-column-grid, .solve-layout, .viewer-layout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .scan-layout {
   grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.75fr);
-  align-items: stretch;
-  height: max(540px, calc(100vh - 260px));
-  max-height: 920px;
+  align-items: start;
+  height: auto;
+  max-height: none;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 .section-header { display: flex; justify-content: space-between; gap: 18px; align-items: end; }
 .hero-card {
@@ -388,11 +388,12 @@ a { color: inherit; }
 }
 
 .scan-camera-pane {
-  height: 100%;
+  height: auto;
+  align-self: start;
   position: sticky;
   top: 20px;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: clamp(340px, 48vh, 540px) auto;
   gap: 12px;
 }
 
@@ -458,27 +459,9 @@ a { color: inherit; }
 }
 
 .scan-task-pane {
-  height: 100%;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-  padding-right: 8px;
-}
-
-.scan-task-pane::-webkit-scrollbar {
-  width: 10px;
-}
-
-.scan-task-pane::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.025);
-  border-radius: 999px;
-}
-
-.scan-task-pane::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.24);
-  border: 2px solid transparent;
-  background-clip: padding-box;
-  border-radius: 999px;
+  height: auto;
+  overflow: visible;
+  padding-right: 0;
 }
 
 .scan-control-stack {
@@ -504,6 +487,9 @@ a { color: inherit; }
   width: 100%;
   height: 100%;
   position: relative;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(89,213,255,0.1), transparent 38%),
+    #050b15;
 }
 .scanner-preview-stack__badge {
   position: absolute;
@@ -511,6 +497,39 @@ a { color: inherit; }
   left: 16px;
 }
 .scanner-preview { width: 100%; height: 100%; object-fit: cover; display: block; }
+.browser-camera__guide {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  height: 56%;
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  border: 2px solid rgba(132, 255, 199, 0.95);
+  border-radius: 16px;
+  box-shadow: 0 0 0 1px rgba(4, 14, 24, 0.7), 0 0 40px rgba(74, 222, 128, 0.13);
+  pointer-events: none;
+}
+.browser-camera__cell {
+  border: 1px solid rgba(190, 255, 221, 0.72);
+}
+.browser-camera__actions {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  gap: 8px;
+}
+.browser-camera__actions .button {
+  min-height: 40px;
+  padding: 9px 14px;
+  backdrop-filter: blur(14px);
+}
+.browser-camera video:not([src]) {
+  color: transparent;
+}
 .instruction-card__chips { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
 .advanced-drawer {
   border: 1px solid var(--border);

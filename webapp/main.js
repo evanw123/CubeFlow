@@ -1,6 +1,6 @@
 import { renderAppShell } from "./components/layout.js";
 import { renderHomePage } from "./pages/home.js";
-import { hydrateScanPage, patchScanPage, renderScanPage } from "./pages/scan.js";
+import { hydrateScanPage, patchScanPage, renderScanPage, startBrowserCamera, stopBrowserCamera } from "./pages/scan.js";
 import { renderReviewPage } from "./pages/review.js";
 import { animateViewerTurn, hydrateViewerPage, renderViewerPage } from "./pages/viewer.js";
 import { renderSolvePage } from "./pages/solve.js";
@@ -363,8 +363,9 @@ async function runAction(action) {
 
     if (action.startsWith("command:")) {
       const command = action.split(":", 2)[1];
-      await api.queueCommand(command);
-      setToast("Command sent to scanner.", "success");
+      const response = await api.runBrowserScannerAction(command);
+      updateStateSnapshot(response.state);
+      setToast(command === "capture" ? "Face captured." : "Scanner updated.", "success");
       return refreshState({ silent: true });
     }
 
@@ -388,7 +389,11 @@ async function runAction(action) {
       }
       case "open-viewer": {
         const result = await api.openViewer();
-        setToast(result.ok ? "Opened native 3D viewer." : result.error, result.ok ? "success" : "warning");
+        if (result.ok && result.browserMode) {
+          navigate("viewer");
+          await loadViewerSession(result.browserMode, { preserveCamera: false, silent: true });
+        }
+        setToast(result.ok ? "Opened 3D viewer." : result.error, result.ok ? "success" : "warning");
         break;
       }
       case "solve-standard": {
@@ -409,11 +414,19 @@ async function runAction(action) {
       }
       case "playback-standard": {
         const result = await api.playbackStandard();
+        if (result.ok && result.browserMode) {
+          navigate("viewer");
+          await loadViewerSession(result.browserMode, { preserveCamera: false, silent: true });
+        }
         setToast(result.ok ? "Opened standard playback." : result.error || "Could not open standard playback.", result.ok ? "success" : "warning");
         break;
       }
       case "playback-cfop": {
         const result = await api.playbackCfop();
+        if (result.ok && result.browserMode) {
+          navigate("viewer");
+          await loadViewerSession(result.browserMode, { preserveCamera: false, silent: true });
+        }
         setToast(result.ok ? "Opened CFOP Beta playback." : result.error || "CFOP Beta playback is not available for this cube.", result.ok ? "success" : "warning");
         break;
       }
@@ -455,6 +468,7 @@ function navigate(route) {
   }
   if (APP.route === "scan" && next !== "scan") {
     APP.scanPreviewToken += 1;
+    stopBrowserCamera();
   }
   if (APP.route === "viewer" && next !== "viewer") {
     stopViewerPlayback();
@@ -504,6 +518,22 @@ function render() {
 }
 
 root.addEventListener("click", async (event) => {
+  const cameraAction = event.target.closest("[data-camera-action]");
+  if (cameraAction && !cameraAction.disabled) {
+    try {
+      if (cameraAction.dataset.cameraAction === "start") {
+        await startBrowserCamera();
+        setToast("Browser camera started.", "success");
+      } else {
+        stopBrowserCamera();
+        setToast("Camera stopped.", "neutral");
+      }
+    } catch (error) {
+      setToast(error.message || "Could not start the camera.", "danger");
+    }
+    return;
+  }
+
   const routeTrigger = event.target.closest("[data-route]");
   if (routeTrigger) {
     navigate(routeTrigger.dataset.route);
@@ -737,6 +767,7 @@ window.addEventListener("hashchange", () => {
   const nextRoute = normalizeRoute(window.location.hash.replace("#", "") || "home");
   if (APP.route === "scan" && nextRoute !== "scan") {
     APP.scanPreviewToken += 1;
+    stopBrowserCamera();
   }
   if (APP.route === "viewer" && nextRoute !== "viewer") {
     stopViewerPlayback();

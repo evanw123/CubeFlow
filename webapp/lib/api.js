@@ -1,10 +1,44 @@
+let memorySessionId = null;
+
+function createSessionId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto?.getRandomValues?.(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function getSessionId() {
+  if (memorySessionId) return memorySessionId;
+  try {
+    const stored = globalThis.sessionStorage?.getItem("cubeflow.session");
+    if (stored) {
+      memorySessionId = stored;
+      return memorySessionId;
+    }
+  } catch (_error) {
+    // Privacy modes may disable storage; the in-memory ID still isolates this page.
+  }
+  memorySessionId = createSessionId();
+  try {
+    globalThis.sessionStorage?.setItem("cubeflow.session", memorySessionId);
+  } catch (_error) {
+    // Keep the generated in-memory ID.
+  }
+  return memorySessionId;
+}
+
 async function request(path, options = {}) {
+  const { headers: optionHeaders = {}, ...requestOptions } = options;
   const response = await fetch(path, {
+    ...requestOptions,
     headers: {
       "Content-Type": "application/json",
-      ...(options.headers || {}),
+      "X-CubeFlow-Session": getSessionId(),
+      ...optionHeaders,
     },
-    ...options,
   });
 
   const isJson = response.headers.get("content-type")?.includes("application/json");
@@ -27,6 +61,9 @@ export const api = {
   launchScanner: () => request("/api/actions/launch-scanner", { method: "POST" }),
   openViewer: () => request("/api/actions/open-viewer", { method: "POST" }),
   queueCommand: (action, payload = {}) => request("/api/actions/command", { method: "POST", body: JSON.stringify({ action, payload }) }),
+  setBrowserCameraRunning: (running, error = null) => request("/api/scanner/camera", { method: "POST", body: JSON.stringify({ running, error }) }),
+  submitBrowserSamples: (payload) => request("/api/scanner/samples", { method: "POST", body: JSON.stringify(payload) }),
+  runBrowserScannerAction: (action) => request("/api/scanner/action", { method: "POST", body: JSON.stringify({ action }) }),
   updateEvaluationTrial: (payload) => request("/api/evaluation/trial", { method: "POST", body: JSON.stringify(payload) }),
   sendClientInfo: (payload) => request("/api/evaluation/client-info", { method: "POST", body: JSON.stringify(payload) }),
   reportPreviewMetrics: (payload) => request("/api/evaluation/preview-metrics", { method: "POST", body: JSON.stringify(payload) }),

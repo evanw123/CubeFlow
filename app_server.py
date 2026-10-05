@@ -3,14 +3,17 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from urllib.parse import urlparse
 
 from cube_backend.app_state import (
@@ -47,15 +50,23 @@ from cube_backend.app_state import (
     update_app_state,
 )
 from cube_backend.cfop_solver import build_cfop_playback_session, solve_cfop_from_cube_state
+from cube_backend.browser_scanner import (
+    execute_browser_scanner_action,
+    process_browser_samples,
+    set_browser_camera_status,
+)
 from cube_backend.cube_state import FACE_ORDER
 from cube_backend.move_utils import parse_alg
 from cube_backend.playback_session import build_playback_session, save_playback_session
 from cube_backend.solver_bridge import format_solution_for_display
 from cube_backend.web_viewer_session import ViewerSessionError, build_web_viewer_session
 from cube_backend.viewer_snapshot import cube_state_to_view_snapshot, save_view_snapshot
+from cube_backend.web_sessions import WEB_SESSION_STORE, validate_session_id
 
-HOST = "127.0.0.1"
-PORT = 8765
+APP_MODE = os.environ.get("CUBEFLOW_MODE", "web" if os.environ.get("RENDER") else "local").strip().lower()
+HOSTED_MODE = APP_MODE in {"web", "hosted", "production"}
+HOST = os.environ.get("HOST", "0.0.0.0" if HOSTED_MODE else "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8765"))
 DIST_DIR = REPO_ROOT / "webapp" / "dist"
 WEBAPP_DIR = REPO_ROOT / "webapp"
 VIEWER_SCRIPT = REPO_ROOT / "cube_viewer_3d.py"
@@ -80,6 +91,7 @@ SCANNER_PREVIEW_TARGET_FPS = 12
 SERVER_PERF_LOG_INTERVAL = 5.0
 SCANNER_STATE_STALE_SECONDS = 3.0
 SCANNER_PREVIEW_STALE_SECONDS = 3.0
+MAX_JSON_BODY_BYTES = 64 * 1024
 
 _PREVIEW_CACHE_LOCK = threading.Lock()
 _PREVIEW_CACHE = {
@@ -91,6 +103,17 @@ _SERVER_METRICS = {
     "scanner_state": {"count": 0, "total_ms": 0.0, "bytes": 0, "last_log_at": time.monotonic()},
     "app_state": {"count": 0, "total_ms": 0.0, "bytes": 0, "last_log_at": time.monotonic()},
 }
+
+
+class CubeFlowHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer's default bind performs a reverse DNS lookup, which can
+        # delay local or container startup. CubeFlow does not use that name.
+        TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = int(self.server_address[1])
 
 
 def _safe_module_version(module_name: str) -> str | None:
@@ -133,8 +156,9 @@ def _build_system_info_payload(state: dict | None = None) -> dict:
             "configuredTargetFps": scanner.get("previewTargetFps", SCANNER_PREVIEW_TARGET_FPS),
             "approxDisplayedFps": current_trial.get("previewFpsApprox"),
             "fpsSource": current_trial.get("previewFpsSource"),
-            "stillEndpoint": scanner.get("previewStillUrl", "/api/scanner/preview.jpg"),
-            "streamEndpoint": scanner.get("previewUrl", "/api/scanner/preview.mjpeg"),
+            "transport": scanner.get("previewTransport", "browser-samples" if HOSTED_MODE else "mjpeg"),
+            "stillEndpoint": scanner.get("previewStillUrl"),
+            "streamEndpoint": scanner.get("previewUrl"),
         },
         "solvers": {
             "standard": {
@@ -309,13 +333,14 @@ def build_frontend_state() -> dict:
     state["scanner"]["scannedFaces"] = scanned_summary["faces"]
     state["scanner"]["manualEditCount"] = manual_edit_count
     scanner_health = _compute_scanner_health(state)
-    state["scanner"]["previewUrl"] = "/api/scanner/preview.mjpeg"
+    state["scanner"]["previewUrl"] = None if HOSTED_MODE else "/api/scanner/preview.mjpeg"
     state["scanner"]["previewUpdatedAt"] = state["scanner"].get("previewUpdatedAt")
     state["scanner"]["lastUpdatedAt"] = state.get("app", {}).get("lastUpdatedAt")
     state["scanner"].update(scanner_health)
     state["scanner"]["capturedFaceCount"] = summary["capturedFaceCount"]
-    state["scanner"]["previewStillUrl"] = "/api/scanner/preview.jpg"
+    state["scanner"]["previewStillUrl"] = None if HOSTED_MODE else "/api/scanner/preview.jpg"
     state["scanner"]["previewTargetFps"] = 10
+    state["scanner"]["previewTransport"] = "browser-samples" if HOSTED_MODE else "mjpeg"
     state["calibration"] = _build_calibration_payload(state)
     state["evaluation"] = _build_evaluation_payload(state)
     state["scanner"].setdefault("advanced", {})
@@ -337,6 +362,12 @@ def build_frontend_state() -> dict:
         }
     }
     state["shortcuts"] = SHORTCUTS
+    state["deployment"] = {
+        "mode": APP_MODE,
+        "hosted": HOSTED_MODE,
+        "browserCamera": True,
+        "nativeScannerAvailable": not HOSTED_MODE,
+    }
     return state
 
 
@@ -368,9 +399,10 @@ def build_scanner_state() -> dict:
             "scannedFaces": scanned_summary["faces"],
             "manualMask": manual_mask,
             "capturedFaceCount": summary["capturedFaceCount"],
-            "previewUrl": "/api/scanner/preview.mjpeg",
-            "previewStillUrl": "/api/scanner/preview.jpg",
+            "previewUrl": None if HOSTED_MODE else "/api/scanner/preview.mjpeg",
+            "previewStillUrl": None if HOSTED_MODE else "/api/scanner/preview.jpg",
             "previewTargetFps": 10,
+            "previewTransport": "browser-samples" if HOSTED_MODE else "mjpeg",
             "statePollMs": SCANNER_STATE_POLL_MS,
             "lastUpdatedAt": state.get("app", {}).get("lastUpdatedAt"),
             "advanced": {
@@ -500,6 +532,9 @@ def solve_cfop() -> dict:
 
 
 def open_current_viewer() -> dict:
+    if HOSTED_MODE:
+        update_app_state({"viewer": {"lastOpenedMode": "current", "lastOpenedAt": now_iso(), "lastSessionTitle": "Current Cube"}})
+        return {"ok": True, "browserMode": "current", "route": "#viewer"}
     cube_state = cube_state_from_store()
     snapshot = cube_state_to_view_snapshot(cube_state)
     save_view_snapshot(snapshot, str(LAST_VIEW_SNAPSHOT_PATH))
@@ -513,6 +548,9 @@ def open_standard_playback() -> dict:
     solve_result = cube_state.solve()
     if not solve_result.success:
         return {"ok": False, "error": solve_result.error or "Standard solve failed."}
+    if HOSTED_MODE:
+        update_app_state({"viewer": {"lastOpenedMode": "standard", "lastOpenedAt": now_iso(), "lastSessionTitle": "Standard Solution Playback"}})
+        return {"ok": True, "browserMode": "standard", "route": "#viewer"}
     session = build_playback_session(
         facelets=solve_result.facelets,
         moves=solve_result.move_list or parse_alg(solve_result.moves or ""),
@@ -535,6 +573,9 @@ def open_cfop_playback() -> dict:
             "failingSlot": result.failing_slot,
             "failingCaseId": result.failing_case_id,
         }
+    if HOSTED_MODE:
+        update_app_state({"viewer": {"lastOpenedMode": "cfop", "lastOpenedAt": now_iso(), "lastSessionTitle": "CFOP Beta Playback"}})
+        return {"ok": True, "browserMode": "cfop", "route": "#viewer"}
     session = build_cfop_playback_session(cube_state.to_facelet_string(), result, title="CFOP Beta Playback")
     save_playback_session(session, str(LAST_PLAYBACK_SESSION_PATH))
     subprocess.Popen([sys.executable, str(VIEWER_SCRIPT), "--session", str(LAST_PLAYBACK_SESSION_PATH)], cwd=str(REPO_ROOT))
@@ -544,6 +585,14 @@ def open_cfop_playback() -> dict:
 
 def _compute_scanner_health(state: dict) -> dict:
     scanner_state = state.get("scanner", {})
+    if scanner_state.get("source") == "browser":
+        running = bool(scanner_state.get("running"))
+        return {
+            "processRunning": False,
+            "previewAvailable": running,
+            "stateAvailable": running,
+            "lastError": scanner_state.get("lastError"),
+        }
     app_state = state.get("app", {})
     last_state_update = app_state.get("lastUpdatedAt")
     last_preview_update = scanner_state.get("previewUpdatedAt")
@@ -616,12 +665,43 @@ def _log_server_metric(label: str, duration_ms: float, payload_size: int) -> Non
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "CubeFlowHTTP/0.1"
 
+    def _resolve_session_id(self) -> str:
+        supplied = self.headers.get("X-CubeFlow-Session")
+        if supplied:
+            return validate_session_id(supplied)
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            name, separator, value = part.strip().partition("=")
+            if separator and name == "cubeflow_session":
+                return validate_session_id(value)
+        return str(uuid.uuid4())
+
     def do_OPTIONS(self):
+        self._session_id = None
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
         self.end_headers()
 
     def do_GET(self):
+        path = urlparse(self.path).path
+        if path in {"/health", "/healthz"}:
+            self._session_id = None
+            return self._send_json({"ok": True, "service": "CubeFlow app server"})
+        if not path.startswith("/api/"):
+            self._session_id = None
+            return self._serve_static(path)
+        try:
+            self._session_id = self._resolve_session_id()
+            with WEB_SESSION_STORE.activate(self._session_id) as session:
+                with session.lock:
+                    return self._handle_get()
+        except ValueError as exc:
+            return self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            print(f"[app-server] GET error: {exc}")
+            return self._send_json({"ok": False, "error": "The request could not be completed."}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _handle_get(self):
         path = urlparse(self.path).path
 
         if path == "/api/state":
@@ -633,12 +713,18 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = build_scanner_state()
             return self._send_json(payload, log_label="scanner_state", started_at=started_at)
         if path == "/api/scanner/preview.mjpeg":
+            if HOSTED_MODE:
+                return self._send_json({"ok": False, "error": "Browser camera video is rendered locally."}, status=HTTPStatus.NOT_FOUND)
             return self._stream_preview_mjpeg()
         if path == "/api/scanner/preview.jpg":
+            if HOSTED_MODE:
+                return self._send_json({"ok": False, "error": "Browser camera video is rendered locally."}, status=HTTPStatus.NOT_FOUND)
             return self._send_scanner_preview_jpeg()
         if path == "/api/settings":
             return self._send_json(load_settings())
         if path == "/api/assets/scan-preview.jpg":
+            if HOSTED_MODE:
+                return self._send_json({"ok": False, "error": "Browser camera video is rendered locally."}, status=HTTPStatus.NOT_FOUND)
             return self._send_file(SCAN_PREVIEW_PATH, "image/jpeg")
         if path == "/api/calibration":
             return self._send_json({"ok": True, "calibration": _build_calibration_payload(load_app_state())})
@@ -666,12 +752,21 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         if path == "/api/shortcuts":
             return self._send_json({"items": SHORTCUTS})
-        if path == "/health":
-            return self._send_json({"ok": True, "service": "CubeFlow app server"})
-
-        return self._serve_static(path)
+        return self._send_json({"ok": False, "error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        try:
+            self._session_id = self._resolve_session_id()
+            with WEB_SESSION_STORE.activate(self._session_id) as session:
+                with session.lock:
+                    return self._handle_post()
+        except ValueError as exc:
+            return self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            print(f"[app-server] POST error: {exc}")
+            return self._send_json({"ok": False, "error": "The request could not be completed."}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _handle_post(self):
         path = urlparse(self.path).path
         body = self._read_json_body()
 
@@ -712,6 +807,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True})
 
         if path == "/api/actions/launch-scanner":
+            if HOSTED_MODE:
+                return self._send_json(
+                    {"ok": False, "error": "Use Start Camera in the Scan page to open the browser camera."},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
             current_state = load_app_state()
             scanner_health = _compute_scanner_health(current_state)
             if scanner_health.get("processRunning"):
@@ -728,8 +828,34 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
             if not isinstance(action, str) or not action:
                 return self._send_json({"ok": False, "error": "Command action is required."}, status=HTTPStatus.BAD_REQUEST)
+            if HOSTED_MODE:
+                return self._send_json(
+                    {"ok": False, "error": "Native scanner commands are unavailable in hosted mode."},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
             command = enqueue_command(action, payload)
             return self._send_json({"ok": True, "command": command})
+
+        if path == "/api/scanner/camera":
+            running = body.get("running")
+            if not isinstance(running, bool):
+                return self._send_json({"ok": False, "error": "running must be a boolean."}, status=HTTPStatus.BAD_REQUEST)
+            set_browser_camera_status(running, error=None if running else body.get("error"))
+            return self._send_json({"ok": True, "state": build_scanner_state()})
+
+        if path == "/api/scanner/samples":
+            try:
+                process_browser_samples(body)
+            except ValueError as exc:
+                return self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return self._send_json({"ok": True, "state": build_scanner_state()})
+
+        if path == "/api/scanner/action":
+            try:
+                execute_browser_scanner_action(str(body.get("action", "")))
+            except ValueError as exc:
+                return self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return self._send_json({"ok": True, "state": build_scanner_state()})
 
         if path == "/api/calibration/capture":
             color_name = str(body.get("color", "")).upper()
@@ -738,9 +864,9 @@ class AppHandler(BaseHTTPRequestHandler):
             current_bgr = state.get("scanner", {}).get("currentCenterBgr")
             if color_name not in CALIBRATION_COLORS:
                 return self._send_json({"ok": False, "error": "Calibration color is required."}, status=HTTPStatus.BAD_REQUEST)
-            if not scanner_health.get("processRunning"):
+            if not (scanner_health.get("processRunning") or state.get("scanner", {}).get("source") == "browser"):
                 return self._send_json(
-                    {"ok": False, "error": "Launch the scanner before capturing calibration from the website."},
+                    {"ok": False, "error": "Start the camera before capturing calibration."},
                     status=HTTPStatus.BAD_REQUEST,
                 )
             if not (
@@ -753,7 +879,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.BAD_REQUEST,
             )
             set_calibration_color(color_name, [int(component) for component in current_bgr])
-            enqueue_command("capture-calibration", {"color": color_name})
+            if not HOSTED_MODE and scanner_health.get("processRunning"):
+                enqueue_command("capture-calibration", {"color": color_name})
             return self._send_json({"ok": True, "state": build_scanner_state()})
 
         if path == "/api/calibration/clear":
@@ -761,13 +888,13 @@ class AppHandler(BaseHTTPRequestHandler):
             if color_name not in CALIBRATION_COLORS:
                 return self._send_json({"ok": False, "error": "Calibration color is required."}, status=HTTPStatus.BAD_REQUEST)
             clear_calibration_color(color_name)
-            if _compute_scanner_health(load_app_state()).get("processRunning"):
+            if not HOSTED_MODE and _compute_scanner_health(load_app_state()).get("processRunning"):
                 enqueue_command("clear-calibration", {"color": color_name})
             return self._send_json({"ok": True, "state": build_scanner_state()})
 
         if path == "/api/calibration/clear_all":
             clear_all_calibration_data()
-            if _compute_scanner_health(load_app_state()).get("processRunning"):
+            if not HOSTED_MODE and _compute_scanner_health(load_app_state()).get("processRunning"):
                 enqueue_command("clear-all-calibration", {})
             return self._send_json({"ok": True, "state": build_scanner_state()})
 
@@ -816,24 +943,31 @@ class AppHandler(BaseHTTPRequestHandler):
         return
 
     def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length header.") from exc
         if length <= 0:
             return {}
+        if length > MAX_JSON_BODY_BYTES:
+            raise ValueError("JSON request body is too large.")
         raw = self.rfile.read(length)
         if not raw:
             return {}
         try:
             payload = json.loads(raw.decode("utf-8"))
             return payload if isinstance(payload, dict) else {}
-        except Exception:
-            return {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Request body must be valid JSON.") from exc
 
     def _serve_static(self, path: str):
         if DIST_DIR.exists():
             if path == "/":
                 target = DIST_DIR / "index.html"
             else:
-                target = DIST_DIR / path.lstrip("/")
+                target = _safe_static_target(DIST_DIR, path)
+                if target is None:
+                    return self._send_json({"ok": False, "error": "Not found"}, status=HTTPStatus.NOT_FOUND)
                 if not target.exists() or target.is_dir():
                     target = DIST_DIR / "index.html"
             if target.exists() and target.is_file():
@@ -844,7 +978,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/":
                 target = WEBAPP_DIR / "index.html"
             else:
-                target = WEBAPP_DIR / path.lstrip("/")
+                target = _safe_static_target(WEBAPP_DIR, path)
+                if target is None:
+                    return self._send_json({"ok": False, "error": "Not found"}, status=HTTPStatus.NOT_FOUND)
                 if not target.exists() or target.is_dir():
                     target = WEBAPP_DIR / "index.html"
             if target.exists() and target.is_file():
@@ -923,8 +1059,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CubeFlow-Session")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        session_id = getattr(self, "_session_id", None)
+        if session_id:
+            self.send_header("X-CubeFlow-Session", session_id)
+            self.send_header("Set-Cookie", f"cubeflow_session={session_id}; Path=/; Max-Age=7200; SameSite=Lax")
 
     def _stream_preview_mjpeg(self):
         boundary = "frame"
@@ -992,6 +1132,14 @@ def _content_type_for(path: Path) -> str:
     }.get(suffix, "application/octet-stream")
 
 
+def _safe_static_target(root: Path, request_path: str) -> Path | None:
+    root_resolved = root.resolve()
+    candidate = (root_resolved / request_path.lstrip("/")).resolve()
+    if candidate != root_resolved and root_resolved not in candidate.parents:
+        return None
+    return candidate
+
+
 def _build_last_validation_label(summary: dict) -> str:
     if not summary["capturedFaceCount"]:
         return "No scan yet"
@@ -1005,8 +1153,8 @@ def _build_last_validation_label(summary: dict) -> str:
 
 
 def main() -> None:
-    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
-    print(f"CubeFlow app server running at http://{HOST}:{PORT}")
+    server = CubeFlowHTTPServer((HOST, PORT), AppHandler)
+    print(f"CubeFlow app server running in {APP_MODE} mode at http://{HOST}:{PORT}")
     server.serve_forever()
 
 
